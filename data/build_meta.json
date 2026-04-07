@@ -1,0 +1,12 @@
+{
+  "n_entities": 5041,
+  "n_valid": 5041,
+  "n_skipped": 4959,
+  "n_prefixes": 16879,
+  "source_csv": "/Users/khan/Downloads/untitled folder 2/files/v6_prod/data/input.csv",
+  "built_at": "2026-04-07T10:24:44Z",
+  "build_duration_sec": 0.05,
+  "record_size": 40,
+  "slot_size": 20,
+  "geocode_pad_len": 24
+}
