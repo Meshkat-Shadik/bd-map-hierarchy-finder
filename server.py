@@ -267,8 +267,9 @@ class V6MmapStore:
         }
 
         # ── Extra-field metadata (optional) ──────────────────────────────────
-        self.metadata   = {}
-        self.schema     = []
+        self.metadata      = {}
+        self.schema        = []
+        self.display_field = 'id'
         meta_file   = os.path.join(DATA_DIR, "entity_metadata.json")
         schema_file = os.path.join(DATA_DIR, "schema.json")
         if os.path.exists(meta_file):
@@ -277,7 +278,8 @@ class V6MmapStore:
         if os.path.exists(schema_file):
             with open(schema_file) as f:
                 sch = json.load(f)
-                self.schema = sch.get("fields", [])
+                self.schema        = sch.get("fields", [])
+                self.display_field = sch.get("display_field", "id")
 
         elapsed = time.perf_counter() - t0
         self.is_loaded = True
@@ -295,9 +297,10 @@ class V6MmapStore:
                     self._mm_id_idx.close()
                 except Exception:
                     pass
-            self.is_loaded = False
-            self.metadata  = {}
-            self.schema    = []
+            self.is_loaded     = False
+            self.metadata      = {}
+            self.schema        = []
+            self.display_field = 'id'
             self._load()
 
     # ------------------------------------------------------------------
@@ -364,6 +367,10 @@ class V6MmapStore:
             return None
         rec = self._read_record(pos)
         rec['metadata'] = self.metadata.get(entity_id, {})
+        if self.display_field and self.display_field != 'id' and self.metadata:
+            label = self.metadata.get(entity_id, {}).get(self.display_field, '')
+            if label:
+                rec['label'] = str(label)
         return rec
 
     def get_area(self, geocode_prefix: str, offset: int = 0, limit: int = 1000
@@ -379,6 +386,11 @@ class V6MmapStore:
             return [], count
         actual_limit = min(limit, count - offset)
         records = self._read_range(start, offset, actual_limit)
+        if self.display_field and self.display_field != 'id' and self.metadata:
+            for r in records:
+                label = self.metadata.get(r['id'], {}).get(self.display_field, '')
+                if label:
+                    r['label'] = str(label)
         return records, count
 
     def list_areas(self, prefix_len: int) -> list[dict]:
@@ -465,7 +477,7 @@ _build_status = {"running": False, "last_result": None, "started_at": None}
 _build_lock = threading.Lock()
 
 
-def _run_build_background(csv_path: str, n_workers: int, extra_fields: list = None):
+def _run_build_background(csv_path: str, n_workers: int, extra_fields: list = None, display_field: str = 'id'):
     global _build_status
     with _build_lock:
         _build_status["running"] = True
@@ -481,6 +493,7 @@ def _run_build_background(csv_path: str, n_workers: int, extra_fields: list = No
             csv_path=csv_path,
             n_workers=n_workers,
             extra_fields=extra_fields or [],
+            display_field=display_field,
             verbose=True,
         )
         with _build_lock:
@@ -528,10 +541,10 @@ def status():
 
 @app.get("/schema")
 def get_schema():
-    """Return the list of extra metadata fields in the current dataset."""
+    """Return the list of extra metadata fields and display_field for the current dataset."""
     if not store or not store.is_loaded:
-        return {"fields": [], "loaded": False}
-    return {"fields": store.schema, "loaded": True}
+        return {"fields": [], "display_field": "id", "loaded": False}
+    return {"fields": store.schema, "display_field": store.display_field, "loaded": True}
 
 
 @app.get("/area/{geocode}/stats")
@@ -582,6 +595,7 @@ async def upload(
     file: UploadFile = File(...),
     workers: int = Query(2, ge=1, le=32),
     extra_fields: str = Form('[]'),
+    display_field: str = Form('id'),
 ):
     """
     Upload a CSV file and trigger async build pipeline.
@@ -621,14 +635,16 @@ async def upload(
     os.replace(dest_tmp, dest)
 
     safe_workers = max(1, min(workers, 4))
-    background_tasks.add_task(_run_build_background, dest, safe_workers, schema)
+    display_field = display_field.strip() or 'id'
+    background_tasks.add_task(_run_build_background, dest, safe_workers, schema, display_field)
 
     return {
-        "accepted":     True,
-        "message":      "Build pipeline started. Poll /status for progress.",
-        "input_file":   dest,
-        "workers":      safe_workers,
-        "extra_fields": schema,
+        "accepted":      True,
+        "message":       "Build pipeline started. Poll /status for progress.",
+        "input_file":    dest,
+        "workers":       safe_workers,
+        "extra_fields":  schema,
+        "display_field": display_field,
     }
 
 

@@ -65,6 +65,7 @@ def run_pipeline(
     n_workers: int = 2,
     chunk_size: int = 100_000,
     extra_fields: list = None,
+    display_field: str = 'id',
     keep_segments: bool = False,
     verbose: bool = True,
 ) -> dict:
@@ -119,6 +120,7 @@ def run_pipeline(
     build_result = build_mod.run_build(
         keep_segments=keep_segments,
         schema_fields=extra_fields,
+        display_field=display_field,
         verbose=verbose,
     )
 

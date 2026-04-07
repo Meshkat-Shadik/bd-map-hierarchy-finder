@@ -63,7 +63,7 @@ def _iter_segment(npy_path: str, ids_path: str):
 
 
 def run_build(keep_segments: bool = False, schema_fields: list = None,
-              verbose: bool = True) -> dict:
+              display_field: str = 'id', verbose: bool = True) -> dict:
     manifest_path = os.path.join(SEGMENTS_DIR, "manifest.json")
     if not os.path.exists(manifest_path):
         raise FileNotFoundError("Segments manifest not found. Run 2_ingest.py first.")
@@ -213,7 +213,7 @@ def run_build(keep_segments: bool = False, schema_fields: list = None,
 
     # ── schema.json ───────────────────────────────────────────────────────────
     with open(os.path.join(DATA_DIR, "schema.json"), 'w') as f:
-        json.dump({"fields": schema_fields, "built_at": built_at}, f)
+        json.dump({"fields": schema_fields, "display_field": display_field or "id", "built_at": built_at}, f)
 
     # ── build_meta.json ───────────────────────────────────────────────────────
     elapsed    = time.perf_counter() - t0
