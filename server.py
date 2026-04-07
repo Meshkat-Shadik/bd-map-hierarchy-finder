@@ -32,8 +32,9 @@ from contextlib import asynccontextmanager
 from typing import Optional
 
 import numpy as np
-from fastapi import FastAPI, Query, Form, UploadFile, File, HTTPException, BackgroundTasks
+from fastapi import FastAPI, Query, Form, UploadFile, File, HTTPException, BackgroundTasks, Body
 from fastapi.middleware.cors import CORSMiddleware
+from pydantic import BaseModel, Field
 import uvicorn
 
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
@@ -400,6 +401,19 @@ class V6MmapStore:
             for gc, (st, cnt) in self._prefix_index.items()
             if len(gc) == prefix_len
         ]
+
+    def get_all_entities(self) -> list[dict]:
+        """Return every entity in one shot — used by /entities/all for single-request loading."""
+        n = self.meta.get("n_entities", 0)
+        if n == 0:
+            return []
+        records = self._read_range(0, 0, n)
+        if self.display_field and self.display_field != 'id' and self.metadata:
+            for r in records:
+                label = self.metadata.get(r['id'], {}).get(self.display_field, '')
+                if label:
+                    r['label'] = str(label)
+        return records
 
     def get_stats(self) -> dict:
         if not self.is_loaded:
@@ -818,6 +832,50 @@ def list_areas(
         'total_areas': len(result),
         'areas': result,
     }
+
+
+@app.get("/entities/all")
+def all_entities():
+    """
+    Return ALL entities in a single request.
+
+    Replaces the old N+1 pattern (GET /areas → N × GET /area/{geocode}).
+    One round trip instead of two → dramatically faster initial map load.
+    Each record includes id, lat, lng, and label (if a display_field is set).
+    """
+    _require_loaded()
+    records = store.get_all_entities()
+    return {
+        "n_entities":    len(records),
+        "display_field": store.display_field,
+        "entities":      records,
+    }
+
+
+class _GeocodeBatchItem(BaseModel):
+    id:  str   = ''
+    lat: float = Field(..., ge=5.0,  le=35.0)
+    lng: float = Field(..., ge=80.0, le=100.0)
+
+class _GeocodeBatchInput(BaseModel):
+    coords: list[_GeocodeBatchItem] = Field(..., min_length=1, max_length=50_000)
+
+
+@app.post("/geocode/batch")
+def geocode_batch(body: _GeocodeBatchInput):
+    """
+    Batch reverse-geocode coordinates → geocode string + full hierarchy.
+
+    Used by the browser when processing a CSV locally (no server-side entity
+    storage required).  The V5 raster lookup runs in <1 ms for 5 000 points,
+    so even 50 000-row CSVs finish in a few seconds.
+    """
+    results = []
+    for item in body.coords:
+        gc = geocoder.get_geocode(item.lat, item.lng)
+        h  = geocoder.build_hierarchy(gc) if gc else {}
+        results.append({'id': item.id, 'geocode': gc, 'hierarchy': h})
+    return {'results': results, 'count': len(results)}
 
 
 # =============================================================================
