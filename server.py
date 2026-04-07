@@ -32,7 +32,7 @@ from contextlib import asynccontextmanager
 from typing import Optional
 
 import numpy as np
-from fastapi import FastAPI, Query, UploadFile, File, HTTPException, BackgroundTasks
+from fastapi import FastAPI, Query, Form, UploadFile, File, HTTPException, BackgroundTasks
 from fastapi.middleware.cors import CORSMiddleware
 import uvicorn
 
@@ -266,10 +266,24 @@ class V6MmapStore:
             for k, s, c in zip(keys, starts, counts)
         }
 
+        # ── Extra-field metadata (optional) ──────────────────────────────────
+        self.metadata   = {}
+        self.schema     = []
+        meta_file   = os.path.join(DATA_DIR, "entity_metadata.json")
+        schema_file = os.path.join(DATA_DIR, "schema.json")
+        if os.path.exists(meta_file):
+            with open(meta_file) as f:
+                self.metadata = json.load(f)
+        if os.path.exists(schema_file):
+            with open(schema_file) as f:
+                sch = json.load(f)
+                self.schema = sch.get("fields", [])
+
         elapsed = time.perf_counter() - t0
         self.is_loaded = True
         print(f"[v6] Index loaded: {n:,} entities, "
-              f"{len(self._prefix_index):,} prefixes in {elapsed:.2f}s")
+              f"{len(self._prefix_index):,} prefixes, "
+              f"{len(self.schema)} extra fields in {elapsed:.2f}s")
 
     def reload(self):
         """Hot-reload all data files without restarting the process."""
@@ -282,6 +296,8 @@ class V6MmapStore:
                 except Exception:
                     pass
             self.is_loaded = False
+            self.metadata  = {}
+            self.schema    = []
             self._load()
 
     # ------------------------------------------------------------------
@@ -342,11 +358,13 @@ class V6MmapStore:
     # ------------------------------------------------------------------
 
     def get_entity(self, entity_id: str) -> Optional[dict]:
-        """Return entity record + geocode, or None."""
+        """Return entity record + geocode + metadata, or None."""
         pos = self._get_entity_pos(entity_id)
         if pos is None:
             return None
-        return self._read_record(pos)
+        rec = self._read_record(pos)
+        rec['metadata'] = self.metadata.get(entity_id, {})
+        return rec
 
     def get_area(self, geocode_prefix: str, offset: int = 0, limit: int = 1000
                  ) -> Optional[tuple[list, int]]:
@@ -447,7 +465,7 @@ _build_status = {"running": False, "last_result": None, "started_at": None}
 _build_lock = threading.Lock()
 
 
-def _run_build_background(csv_path: str, n_workers: int):
+def _run_build_background(csv_path: str, n_workers: int, extra_fields: list = None):
     global _build_status
     with _build_lock:
         _build_status["running"] = True
@@ -459,7 +477,12 @@ def _run_build_background(csv_path: str, n_workers: int):
         spec = spec_from_file_location("rebuilder", os.path.join(BASE_DIR, "rebuilder.py"))
         rebuilder = module_from_spec(spec)
         spec.loader.exec_module(rebuilder)
-        result = rebuilder.run_pipeline(csv_path=csv_path, n_workers=n_workers, verbose=True)
+        result = rebuilder.run_pipeline(
+            csv_path=csv_path,
+            n_workers=n_workers,
+            extra_fields=extra_fields or [],
+            verbose=True,
+        )
         with _build_lock:
             _build_status["last_result"] = result
     except Exception as e:
@@ -503,14 +526,68 @@ def status():
     }
 
 
+@app.get("/schema")
+def get_schema():
+    """Return the list of extra metadata fields in the current dataset."""
+    if not store or not store.is_loaded:
+        return {"fields": [], "loaded": False}
+    return {"fields": store.schema, "loaded": True}
+
+
+@app.get("/area/{geocode}/stats")
+def area_stats(geocode: str):
+    """
+    Return aggregate statistics for numeric extra fields across all entities
+    in the given geographic area.
+    """
+    _require_loaded()
+    result = store.get_area(geocode, offset=0, limit=999_999)
+    if result is None:
+        raise HTTPException(404, f"No data for geocode: {geocode!r}")
+
+    entities, total = result
+
+    if not store.schema or not store.metadata:
+        return {"geocode": geocode, "total": total, "stats": {}}
+
+    # Compute per-field numeric stats
+    buckets: dict[str, list[float]] = {f: [] for f in store.schema}
+    for e in entities:
+        meta = store.metadata.get(e["id"], {})
+        for field in store.schema:
+            raw = meta.get(field, "")
+            if raw != "":
+                try:
+                    buckets[field].append(float(raw))
+                except (ValueError, TypeError):
+                    pass
+
+    stats = {}
+    for field, vals in buckets.items():
+        if vals:
+            stats[field] = {
+                "count": len(vals),
+                "sum":   round(sum(vals), 2),
+                "avg":   round(sum(vals) / len(vals), 2),
+                "min":   round(min(vals), 2),
+                "max":   round(max(vals), 2),
+            }
+
+    return {"geocode": geocode, "total": total, "stats": stats}
+
+
 @app.post("/upload")
 async def upload(
     background_tasks: BackgroundTasks,
     file: UploadFile = File(...),
     workers: int = Query(2, ge=1, le=32),
+    extra_fields: str = Form('[]'),
 ):
     """
-    Upload a CSV file (id,lat,lng) and trigger async build pipeline.
+    Upload a CSV file and trigger async build pipeline.
+
+    extra_fields: JSON array of column names to store as entity metadata.
+    Example: extra_fields='["manager_name","today_revenue","medicine_stock"]'
 
     The build runs in the background. Poll /status to check progress.
     When complete, the server hot-reloads the new index automatically.
@@ -521,11 +598,19 @@ async def upload(
     if not file.filename.lower().endswith('.csv'):
         raise HTTPException(400, "File must be .csv")
 
+    # Parse extra_fields JSON
+    try:
+        schema = json.loads(extra_fields)
+        if not isinstance(schema, list):
+            schema = []
+        schema = [str(f).strip() for f in schema if str(f).strip()]
+    except Exception:
+        schema = []
+
     os.makedirs(DATA_DIR, exist_ok=True)
-    dest = os.path.join(DATA_DIR, "input.csv")
+    dest     = os.path.join(DATA_DIR, "input.csv")
     dest_tmp = dest + ".tmp"
 
-    # Stream to disk in 1 MB chunks (handles files of any size)
     with open(dest_tmp, 'wb') as f:
         while True:
             chunk = await file.read(1024 * 1024)
@@ -533,16 +618,17 @@ async def upload(
                 break
             f.write(chunk)
 
-    os.replace(dest_tmp, dest)  # atomic
+    os.replace(dest_tmp, dest)
 
     safe_workers = max(1, min(workers, 4))
-    background_tasks.add_task(_run_build_background, dest, safe_workers)
+    background_tasks.add_task(_run_build_background, dest, safe_workers, schema)
 
     return {
-        "accepted": True,
-        "message": "Build pipeline started. Poll /status for progress.",
-        "input_file": dest,
-        "workers": safe_workers,
+        "accepted":     True,
+        "message":      "Build pipeline started. Poll /status for progress.",
+        "input_file":   dest,
+        "workers":      safe_workers,
+        "extra_fields": schema,
     }
 
 
