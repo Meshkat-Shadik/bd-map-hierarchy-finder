@@ -15,6 +15,6 @@ jobs:
           lfs: true
       - name: Push to hub
         env:
-          HF_TOKEN: ${{ secrets.HF_TOKEN }}
+          HF_TOKEN_BD_HIERARCHY: ${{ secrets.HF_TOKEN_BD_HIERARCHY }}
         run: |
           git push --force https://Meshkat-Shadik:$HF_TOKEN_BD_HIERARCHY@huggingface.co/spaces/MeshkatShadik/bd-hierarchy-location-finder main
