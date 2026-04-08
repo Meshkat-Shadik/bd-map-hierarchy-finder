@@ -26,7 +26,7 @@ import numpy as np
 
 BASE_DIR     = os.path.dirname(os.path.abspath(__file__))
 DATA_DIR     = os.path.join(BASE_DIR, "data")
-SEGMENTS_DIR = os.path.join(DATA_DIR, "segments")
+SEGMENTS_DIR = os.path.join(DATA_DIR, "segments")  # module-level default only
 
 CANONICAL_BREAKS = [2, 4, 8, 13, 16, 20, 22]
 
@@ -63,8 +63,10 @@ def _iter_segment(npy_path: str, ids_path: str):
 
 
 def run_build(keep_segments: bool = False, schema_fields: list = None,
-              display_field: str = 'id', verbose: bool = True) -> dict:
-    manifest_path = os.path.join(SEGMENTS_DIR, "manifest.json")
+              display_field: str = 'id', data_dir: str = None, verbose: bool = True) -> dict:
+    effective_data_dir = data_dir or DATA_DIR
+    segments_dir = os.path.join(effective_data_dir, "segments")
+    manifest_path = os.path.join(segments_dir, "manifest.json")
     if not os.path.exists(manifest_path):
         raise FileNotFoundError("Segments manifest not found. Run 2_ingest.py first.")
 
@@ -85,17 +87,17 @@ def run_build(keep_segments: bool = False, schema_fields: list = None,
 
     t0 = time.perf_counter()
 
-    entities_path = os.path.join(DATA_DIR, "entities_sorted.bin.tmp")
-    pool_path     = os.path.join(DATA_DIR, "entity_id_pool.bin.tmp")
-    id_index_path = os.path.join(DATA_DIR, "entity_id_index.bin.tmp")
-    keys_path     = os.path.join(DATA_DIR, "geocode_keys.bin.tmp")
-    starts_path   = os.path.join(DATA_DIR, "prefix_starts.bin.tmp")
-    counts_path   = os.path.join(DATA_DIR, "prefix_counts.bin.tmp")
+    entities_path = os.path.join(effective_data_dir, "entities_sorted.bin.tmp")
+    pool_path     = os.path.join(effective_data_dir, "entity_id_pool.bin.tmp")
+    id_index_path = os.path.join(effective_data_dir, "entity_id_index.bin.tmp")
+    keys_path     = os.path.join(effective_data_dir, "geocode_keys.bin.tmp")
+    starts_path   = os.path.join(effective_data_dir, "prefix_starts.bin.tmp")
+    counts_path   = os.path.join(effective_data_dir, "prefix_counts.bin.tmp")
 
     segment_iters = []
     for i in range(n_segments):
-        npy = os.path.join(SEGMENTS_DIR, f"seg_{i:06d}.npy")
-        ids = os.path.join(SEGMENTS_DIR, f"seg_{i:06d}.ids")
+        npy = os.path.join(segments_dir, f"seg_{i:06d}.npy")
+        ids = os.path.join(segments_dir, f"seg_{i:06d}.ids")
         if os.path.exists(npy) and os.path.exists(ids):
             segment_iters.append(_iter_segment(npy, ids))
 
@@ -179,12 +181,12 @@ def run_build(keep_segments: bool = False, schema_fields: list = None,
 
     # ── Atomic rename ─────────────────────────────────────────────────────────
     for tmp, final in [
-        (entities_path, os.path.join(DATA_DIR, "entities_sorted.bin")),
-        (pool_path,     os.path.join(DATA_DIR, "entity_id_pool.bin")),
-        (id_index_path, os.path.join(DATA_DIR, "entity_id_index.bin")),
-        (keys_path,     os.path.join(DATA_DIR, "geocode_keys.bin")),
-        (starts_path,   os.path.join(DATA_DIR, "prefix_starts.bin")),
-        (counts_path,   os.path.join(DATA_DIR, "prefix_counts.bin")),
+        (entities_path, os.path.join(effective_data_dir, "entities_sorted.bin")),
+        (pool_path,     os.path.join(effective_data_dir, "entity_id_pool.bin")),
+        (id_index_path, os.path.join(effective_data_dir, "entity_id_index.bin")),
+        (keys_path,     os.path.join(effective_data_dir, "geocode_keys.bin")),
+        (starts_path,   os.path.join(effective_data_dir, "prefix_starts.bin")),
+        (counts_path,   os.path.join(effective_data_dir, "prefix_counts.bin")),
     ]:
         if os.path.exists(final):
             os.remove(final)
@@ -198,21 +200,21 @@ def run_build(keep_segments: bool = False, schema_fields: list = None,
             print(f"[build] Merging metadata ({len(schema_fields)} fields)…")
         all_metadata = {}
         for i in range(n_segments):
-            meta_path = os.path.join(SEGMENTS_DIR, f"seg_{i:06d}.meta")
+            meta_path = os.path.join(segments_dir, f"seg_{i:06d}.meta")
             if os.path.exists(meta_path):
                 with open(meta_path) as f:
                     all_metadata.update(json.load(f))
-        with open(os.path.join(DATA_DIR, "entity_metadata.json"), 'w') as f:
+        with open(os.path.join(effective_data_dir, "entity_metadata.json"), 'w') as f:
             json.dump(all_metadata, f)
         if verbose:
             print(f"[build] Metadata: {len(all_metadata):,} entities.")
     else:
-        stale = os.path.join(DATA_DIR, "entity_metadata.json")
+        stale = os.path.join(effective_data_dir, "entity_metadata.json")
         if os.path.exists(stale):
             os.remove(stale)
 
     # ── schema.json ───────────────────────────────────────────────────────────
-    with open(os.path.join(DATA_DIR, "schema.json"), 'w') as f:
+    with open(os.path.join(effective_data_dir, "schema.json"), 'w') as f:
         json.dump({"fields": schema_fields, "display_field": display_field or "id", "built_at": built_at}, f)
 
     # ── build_meta.json ───────────────────────────────────────────────────────
@@ -230,11 +232,11 @@ def run_build(keep_segments: bool = False, schema_fields: list = None,
         "slot_size":          SLOT_SIZE,
         "geocode_pad_len":    24,
     }
-    with open(os.path.join(DATA_DIR, "build_meta.json"), 'w') as f:
+    with open(os.path.join(effective_data_dir, "build_meta.json"), 'w') as f:
         json.dump(build_meta, f, indent=2)
 
     if not keep_segments:
-        shutil.rmtree(SEGMENTS_DIR, ignore_errors=True)
+        shutil.rmtree(segments_dir, ignore_errors=True)
         if verbose:
             print("[build] Segments cleaned up.")
 

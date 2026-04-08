@@ -26,7 +26,7 @@ import numpy as np
 BASE_DIR     = os.path.dirname(os.path.abspath(__file__))
 V5_DATA_DIR  = os.environ.get("V5_DATA_DIR", os.path.join(BASE_DIR, "v5_data"))
 DATA_DIR     = os.path.join(BASE_DIR, "data")
-SEGMENTS_DIR = os.path.join(DATA_DIR, "segments")
+SEGMENTS_DIR = os.path.join(DATA_DIR, "segments")   # module-level default only
 
 SEGMENT_DTYPE = np.dtype([
     ('geocode', 'S24'),
@@ -184,19 +184,22 @@ def _read_chunks(csv_path, chunk_size, lat_col, lng_col, id_col, extra_fields):
 
 def run_ingest(csv_path: str, n_workers: int = 2, chunk_size: int = 100_000,
                lat_col: str = 'lat', lng_col: str = 'lng', id_col: str = 'id',
-               extra_fields: list = None, verbose: bool = True) -> dict:
+               extra_fields: list = None, data_dir: str = None, verbose: bool = True) -> dict:
     """
     Ingest a CSV file and write sorted segment files.
     extra_fields: list of column names to capture as entity metadata.
+    data_dir: override destination directory (defaults to module-level DATA_DIR).
     """
     if not os.path.exists(csv_path):
         raise FileNotFoundError(f"CSV not found: {csv_path}")
 
-    os.makedirs(SEGMENTS_DIR, exist_ok=True)
+    effective_data_dir = data_dir or DATA_DIR
+    segments_dir = os.path.join(effective_data_dir, "segments")
+    os.makedirs(segments_dir, exist_ok=True)
 
-    for fname in os.listdir(SEGMENTS_DIR):
+    for fname in os.listdir(segments_dir):
         if fname.startswith('seg_') or fname == 'manifest.json':
-            os.remove(os.path.join(SEGMENTS_DIR, fname))
+            os.remove(os.path.join(segments_dir, fname))
 
     extra_fields  = list(extra_fields or [])
     t0            = time.perf_counter()
@@ -217,7 +220,7 @@ def run_ingest(csv_path: str, n_workers: int = 2, chunk_size: int = 100_000,
 
     def _save_segment(arr, ids, extras):
         nonlocal n_segments
-        seg_path = os.path.join(SEGMENTS_DIR, f"seg_{n_segments:06d}")
+        seg_path = os.path.join(segments_dir, f"seg_{n_segments:06d}")
         np.save(seg_path + ".npy", arr)
         with open(seg_path + ".ids", 'w', encoding='utf-8') as fh:
             fh.write('\n'.join(ids))
@@ -273,7 +276,7 @@ def run_ingest(csv_path: str, n_workers: int = 2, chunk_size: int = 100_000,
         "source_csv":   os.path.abspath(csv_path),
         "elapsed_sec":  round(time.perf_counter() - t0, 2),
     }
-    with open(os.path.join(SEGMENTS_DIR, "manifest.json"), 'w') as f:
+    with open(os.path.join(segments_dir, "manifest.json"), 'w') as f:
         json.dump(manifest, f, indent=2)
 
     if verbose:

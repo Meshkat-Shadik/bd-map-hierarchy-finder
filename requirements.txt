@@ -2,3 +2,5 @@ fastapi
 uvicorn
 numpy
 python-multipart
+google-auth
+requests

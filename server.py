@@ -34,8 +34,16 @@ from typing import Optional
 import numpy as np
 from fastapi import FastAPI, Query, Form, UploadFile, File, HTTPException, BackgroundTasks, Body
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import FileResponse
 from pydantic import BaseModel, Field
 import uvicorn
+from google.oauth2 import id_token as google_id_token
+from google.auth.transport import requests as google_auth_requests
+
+GOOGLE_CLIENT_ID = os.environ.get(
+    "GOOGLE_CLIENT_ID",
+    "476786425809-4ju4v578ae38vl0hu8sraoe1d61r230v.apps.googleusercontent.com",
+)
 
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 DATA_DIR = os.path.join(BASE_DIR, "data")
@@ -221,20 +229,22 @@ class V6MmapStore:
       build_meta.json      — build metadata
     """
 
-    def __init__(self):
+    def __init__(self, data_dir: str = None):
+        self._data_dir = data_dir or DATA_DIR
         self.is_loaded = False
         self._lock = threading.RLock()
         self._load()
 
     def _load(self):
-        meta_path = os.path.join(DATA_DIR, "build_meta.json")
-        entities_path = os.path.join(DATA_DIR, "entities_sorted.bin")
+        d = self._data_dir
+        meta_path     = os.path.join(d, "build_meta.json")
+        entities_path = os.path.join(d, "entities_sorted.bin")
 
         if not os.path.exists(meta_path) or not os.path.exists(entities_path):
-            print("[v6] No index found — upload a CSV to build it.")
+            print(f"[v6] No index in {d} — upload a CSV to build it.")
             return
 
-        print("[v6] Loading V6 binary index...")
+        print(f"[v6] Loading index from {d}…")
         t0 = time.perf_counter()
 
         with open(meta_path) as f:
@@ -242,37 +252,30 @@ class V6MmapStore:
 
         n = self.meta["n_entities"]
 
-        # mmap entity records (40B each)
         f_ent = open(entities_path, "rb")
         self._mm_entities = mmap.mmap(f_ent.fileno(), 0, access=mmap.ACCESS_READ)
 
-        # mmap entity ID pool
-        f_pool = open(os.path.join(DATA_DIR, "entity_id_pool.bin"), "rb")
+        f_pool = open(os.path.join(d, "entity_id_pool.bin"), "rb")
         self._mm_pool = mmap.mmap(f_pool.fileno(), 0, access=mmap.ACCESS_READ)
 
-        # mmap ID index slots
-        f_idx = open(os.path.join(DATA_DIR, "entity_id_index.bin"), "rb")
+        f_idx = open(os.path.join(d, "entity_id_index.bin"), "rb")
         self._mm_id_idx = mmap.mmap(f_idx.fileno(), 0, access=mmap.ACCESS_READ)
-        self._id_slots = np.ndarray(n, dtype=SLOT_DTYPE, buffer=self._mm_id_idx)
-
-        # Load hash column into RAM for fast np.searchsorted (8B × N)
+        self._id_slots  = np.ndarray(n, dtype=SLOT_DTYPE, buffer=self._mm_id_idx)
         self._id_hashes = np.array(self._id_slots['h'], dtype=np.uint64)
 
-        # Load prefix index into RAM dict  (~65 MB max)
-        keys  = np.fromfile(os.path.join(DATA_DIR, "geocode_keys.bin"),   dtype='S24')
-        starts = np.fromfile(os.path.join(DATA_DIR, "prefix_starts.bin"), dtype=np.uint32)
-        counts = np.fromfile(os.path.join(DATA_DIR, "prefix_counts.bin"), dtype=np.uint32)
+        keys   = np.fromfile(os.path.join(d, "geocode_keys.bin"),   dtype='S24')
+        starts = np.fromfile(os.path.join(d, "prefix_starts.bin"),  dtype=np.uint32)
+        counts = np.fromfile(os.path.join(d, "prefix_counts.bin"),  dtype=np.uint32)
         self._prefix_index = {
             k.rstrip(b'\x00').decode('ascii'): (int(s), int(c))
             for k, s, c in zip(keys, starts, counts)
         }
 
-        # ── Extra-field metadata (optional) ──────────────────────────────────
         self.metadata      = {}
         self.schema        = []
         self.display_field = 'id'
-        meta_file   = os.path.join(DATA_DIR, "entity_metadata.json")
-        schema_file = os.path.join(DATA_DIR, "schema.json")
+        meta_file   = os.path.join(d, "entity_metadata.json")
+        schema_file = os.path.join(d, "schema.json")
         if os.path.exists(meta_file):
             with open(meta_file) as f:
                 self.metadata = json.load(f)
@@ -285,8 +288,7 @@ class V6MmapStore:
         elapsed = time.perf_counter() - t0
         self.is_loaded = True
         print(f"[v6] Index loaded: {n:,} entities, "
-              f"{len(self._prefix_index):,} prefixes, "
-              f"{len(self.schema)} extra fields in {elapsed:.2f}s")
+              f"{len(self._prefix_index):,} prefixes in {elapsed:.2f}s")
 
     def reload(self):
         """Hot-reload all data files without restarting the process."""
@@ -403,11 +405,17 @@ class V6MmapStore:
         ]
 
     def get_all_entities(self) -> list[dict]:
-        """Return every entity in one shot — used by /entities/all for single-request loading."""
-        n = self.meta.get("n_entities", 0)
-        if n == 0:
+        """
+        Return up to ENTITY_RENDER_LIMIT entities.
+
+        50M entities × 50 B/entity ≈ 2.5 GB — not feasible as a single JSON response.
+        Callers check .meta["n_entities"] to detect truncation.
+        """
+        n      = self.meta.get("n_entities", 0)
+        actual = min(n, ENTITY_RENDER_LIMIT)
+        if actual == 0:
             return []
-        records = self._read_range(0, 0, n)
+        records = self._read_range(0, 0, actual)
         if self.display_field and self.display_field != 'id' and self.metadata:
             for r in records:
                 label = self.metadata.get(r['id'], {}).get(self.display_field, '')
@@ -430,38 +438,112 @@ class V6MmapStore:
 
 
 # =============================================================================
+# Session Manager — one V6MmapStore per browser session (UUID)
+# =============================================================================
+
+SESSIONS_DIR    = os.path.join(BASE_DIR, "data", "sessions")
+USERS_DIR       = os.path.join(BASE_DIR, "data", "users")   # persistent, never evicted
+MAX_SESSIONS    = 30        # LRU eviction when limit reached (anonymous only)
+SESSION_TTL_SEC = 86400     # 24 h of inactivity → evict (anonymous only)
+# Cap for /entities/all to prevent gigantic JSON responses (50M rows × 50B ≈ 2.5 GB)
+ENTITY_RENDER_LIMIT = 200_000
+
+
+def _session_data_dir(session_id: str) -> str:
+    """Map a session ID to its data directory.
+    'default'  → data/
+    'u_{sub}'  → data/users/{sub}/   (Google-authenticated, permanent)
+    '{uuid}'   → data/sessions/{uuid}/  (anonymous, LRU-evicted)
+    """
+    if session_id == 'default':
+        return DATA_DIR
+    if session_id.startswith('u_'):
+        return os.path.join(USERS_DIR, session_id[2:])
+    return os.path.join(SESSIONS_DIR, session_id)
+
+
+class _SessionManager:
+    def __init__(self):
+        self._sessions: dict[str, dict] = {}   # sid → {store, last_seen}
+        self._lock = threading.RLock()
+
+    def get(self, session_id: str) -> 'V6MmapStore':
+        with self._lock:
+            self._evict()
+            if session_id not in self._sessions:
+                d = _session_data_dir(session_id)
+                os.makedirs(d, exist_ok=True)
+                self._sessions[session_id] = {
+                    'store':     V6MmapStore(d),
+                    'last_seen': time.time(),
+                }
+            else:
+                self._sessions[session_id]['last_seen'] = time.time()
+            return self._sessions[session_id]['store']
+
+    def reload(self, session_id: str):
+        with self._lock:
+            if session_id in self._sessions:
+                self._sessions[session_id]['store'].reload()
+            else:
+                # Session not cached yet — create fresh
+                self.get(session_id)
+
+    def _evict(self):
+        now = time.time()
+        # Only evict anonymous sessions (u_ prefix = authenticated, never evict)
+        expired = [sid for sid, s in self._sessions.items()
+                   if not sid.startswith('u_') and now - s['last_seen'] > SESSION_TTL_SEC]
+        for sid in expired:
+            del self._sessions[sid]
+        anon = [sid for sid in list(self._sessions) if not sid.startswith('u_')]
+        while len(anon) >= MAX_SESSIONS:
+            oldest = min(anon, key=lambda s: self._sessions[s]['last_seen'])
+            del self._sessions[oldest]
+            anon.remove(oldest)
+
+
+# =============================================================================
 # Global instances (populated in lifespan)
 # =============================================================================
 
 geocoder: V5Geocoder = None
-store: V6MmapStore = None
+session_mgr: _SessionManager = None
 
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    global geocoder, store
-    geocoder = V5Geocoder.get()
-    store = V6MmapStore()
-    # Background task: watch for hot-reload signal
-    task = asyncio.create_task(_watch_reload_signal())
+    global geocoder, session_mgr
+    geocoder    = V5Geocoder.get()
+    session_mgr = _SessionManager()
+    # Pre-warm the default session (existing data/ directory)
+    session_mgr.get('default')
+    task = asyncio.create_task(_watch_reload_signals())
     yield
     task.cancel()
 
 
-async def _watch_reload_signal():
-    """Check every 2 seconds for data/.reload_signal and hot-reload if found."""
-    signal_path = os.path.join(DATA_DIR, ".reload_signal")
+async def _watch_reload_signals():
+    """
+    Every 2 s scan for .reload_signal files in data/ and data/sessions/*/.
+    When found, hot-reload the corresponding session's store.
+    """
     while True:
         await asyncio.sleep(2)
-        if os.path.exists(signal_path):
-            try:
-                os.remove(signal_path)
-            except OSError:
-                pass
-            print("[v6] Reload signal detected — reloading index...")
-            loop = asyncio.get_event_loop()
-            await loop.run_in_executor(None, store.reload)
-            print("[v6] Hot-reload complete.")
+        dirs_to_check = [('default', DATA_DIR)]
+        if os.path.isdir(SESSIONS_DIR):
+            for sid in os.listdir(SESSIONS_DIR):
+                dirs_to_check.append((sid, os.path.join(SESSIONS_DIR, sid)))
+        for session_id, d in dirs_to_check:
+            sig = os.path.join(d, ".reload_signal")
+            if os.path.exists(sig):
+                try:
+                    os.remove(sig)
+                except OSError:
+                    pass
+                print(f"[v6] Reload signal for session={session_id!r}")
+                loop = asyncio.get_event_loop()
+                await loop.run_in_executor(None, session_mgr.reload, session_id)
 
 
 # =============================================================================
@@ -491,12 +573,25 @@ _build_status = {"running": False, "last_result": None, "started_at": None}
 _build_lock = threading.Lock()
 
 
-def _run_build_background(csv_path: str, n_workers: int, extra_fields: list = None, display_field: str = 'id'):
-    global _build_status
+_build_status: dict[str, dict] = {}   # session_id → status dict
+
+
+def _get_or_init_build_status(session_id: str) -> dict:
+    if session_id not in _build_status:
+        _build_status[session_id] = {"running": False, "last_result": None, "started_at": None}
+    return _build_status[session_id]
+
+
+def _run_build_background(csv_path: str, n_workers: int, session_id: str = 'default',
+                           extra_fields: list = None, display_field: str = 'id'):
     with _build_lock:
-        _build_status["running"] = True
-        _build_status["started_at"] = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
-        _build_status["last_result"] = None
+        st = _get_or_init_build_status(session_id)
+        st["running"]    = True
+        st["started_at"] = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
+        st["last_result"]= None
+
+    data_dir = _session_data_dir(session_id)
+    os.makedirs(data_dir, exist_ok=True)
 
     try:
         from importlib.util import spec_from_file_location, module_from_spec
@@ -508,17 +603,18 @@ def _run_build_background(csv_path: str, n_workers: int, extra_fields: list = No
             n_workers=n_workers,
             extra_fields=extra_fields or [],
             display_field=display_field,
+            data_dir=data_dir,
             verbose=True,
         )
         with _build_lock:
-            _build_status["last_result"] = result
+            _build_status[session_id]["last_result"] = result
     except Exception as e:
-        print(f"[v6] Build failed: {e}")
+        print(f"[v6] Build failed (session={session_id}): {e}")
         with _build_lock:
-            _build_status["last_result"] = {"success": False, "error": str(e)}
+            _build_status[session_id]["last_result"] = {"success": False, "error": str(e)}
     finally:
         with _build_lock:
-            _build_status["running"] = False
+            _build_status[session_id]["running"] = False
 
 
 # =============================================================================
@@ -530,7 +626,7 @@ def root():
     return {
         "name": "V6 Location Aggregator",
         "version": "6.1.0",
-        "status": "ready" if (store and store.is_loaded) else "no_data",
+        "status": "ready",
         "endpoints": {
             "upload":   "POST /upload (CSV file: id,lat,lng)",
             "status":   "GET /status",
@@ -543,90 +639,51 @@ def root():
 
 
 @app.get("/status")
-def status():
-    stats = store.get_stats() if store else {"is_loaded": False}
+def status(session_id: str = Query('default')):
+    st    = _get_or_init_build_status(session_id)
+    s     = session_mgr.get(session_id)
+    stats = s.get_stats() if s else {"is_loaded": False}
     return {
         **stats,
-        "build_running": _build_status["running"],
-        "build_started": _build_status["started_at"],
-        "build_result":  _build_status["last_result"],
+        "session_id":    session_id,
+        "build_running": st["running"],
+        "build_started": st["started_at"],
+        "build_result":  st["last_result"],
     }
 
 
 @app.get("/schema")
-def get_schema():
-    """Return the list of extra metadata fields and display_field for the current dataset."""
-    if not store or not store.is_loaded:
+def get_schema(session_id: str = Query('default')):
+    """Return the list of extra metadata fields and display_field for the current session."""
+    s = session_mgr.get(session_id)
+    if not s or not s.is_loaded:
         return {"fields": [], "display_field": "id", "loaded": False}
-    return {"fields": store.schema, "display_field": store.display_field, "loaded": True}
-
-
-@app.get("/area/{geocode}/stats")
-def area_stats(geocode: str):
-    """
-    Return aggregate statistics for numeric extra fields across all entities
-    in the given geographic area.
-    """
-    _require_loaded()
-    result = store.get_area(geocode, offset=0, limit=999_999)
-    if result is None:
-        raise HTTPException(404, f"No data for geocode: {geocode!r}")
-
-    entities, total = result
-
-    if not store.schema or not store.metadata:
-        return {"geocode": geocode, "total": total, "stats": {}}
-
-    # Compute per-field numeric stats
-    buckets: dict[str, list[float]] = {f: [] for f in store.schema}
-    for e in entities:
-        meta = store.metadata.get(e["id"], {})
-        for field in store.schema:
-            raw = meta.get(field, "")
-            if raw != "":
-                try:
-                    buckets[field].append(float(raw))
-                except (ValueError, TypeError):
-                    pass
-
-    stats = {}
-    for field, vals in buckets.items():
-        if vals:
-            stats[field] = {
-                "count": len(vals),
-                "sum":   round(sum(vals), 2),
-                "avg":   round(sum(vals) / len(vals), 2),
-                "min":   round(min(vals), 2),
-                "max":   round(max(vals), 2),
-            }
-
-    return {"geocode": geocode, "total": total, "stats": stats}
+    return {"fields": s.schema, "display_field": s.display_field, "loaded": True}
 
 
 @app.post("/upload")
 async def upload(
     background_tasks: BackgroundTasks,
     file: UploadFile = File(...),
-    workers: int = Query(2, ge=1, le=32),
-    extra_fields: str = Form('[]'),
+    workers:       int = Query(2, ge=1, le=32),
+    session_id:    str = Form('default'),
+    extra_fields:  str = Form('[]'),
     display_field: str = Form('id'),
 ):
     """
     Upload a CSV file and trigger async build pipeline.
 
+    session_id: browser UUID — each user uploads to their own slot (no conflicts).
     extra_fields: JSON array of column names to store as entity metadata.
-    Example: extra_fields='["manager_name","today_revenue","medicine_stock"]'
-
-    The build runs in the background. Poll /status to check progress.
-    When complete, the server hot-reloads the new index automatically.
+    The build runs in the background. Poll /status?session_id=... to check progress.
     """
-    if _build_status["running"]:
-        raise HTTPException(409, "A build is already running. Check /status.")
+    st = _get_or_init_build_status(session_id)
+    if st["running"]:
+        raise HTTPException(409, f"A build is already running for session {session_id!r}.")
 
     if not file.filename.lower().endswith('.csv'):
         raise HTTPException(400, "File must be .csv")
 
-    # Parse extra_fields JSON
     try:
         schema = json.loads(extra_fields)
         if not isinstance(schema, list):
@@ -635,8 +692,9 @@ async def upload(
     except Exception:
         schema = []
 
-    os.makedirs(DATA_DIR, exist_ok=True)
-    dest     = os.path.join(DATA_DIR, "input.csv")
+    data_dir = _session_data_dir(session_id)
+    os.makedirs(data_dir, exist_ok=True)
+    dest     = os.path.join(data_dir, "input.csv")
     dest_tmp = dest + ".tmp"
 
     with open(dest_tmp, 'wb') as f:
@@ -645,17 +703,18 @@ async def upload(
             if not chunk:
                 break
             f.write(chunk)
-
     os.replace(dest_tmp, dest)
 
-    safe_workers = max(1, min(workers, 4))
+    safe_workers  = max(1, min(workers, 4))
     display_field = display_field.strip() or 'id'
-    background_tasks.add_task(_run_build_background, dest, safe_workers, schema, display_field)
+    background_tasks.add_task(
+        _run_build_background, dest, safe_workers, session_id, schema, display_field
+    )
 
     return {
         "accepted":      True,
-        "message":       "Build pipeline started. Poll /status for progress.",
-        "input_file":    dest,
+        "session_id":    session_id,
+        "message":       "Build pipeline started. Poll /status?session_id=... for progress.",
         "workers":       safe_workers,
         "extra_fields":  schema,
         "display_field": display_field,
@@ -663,37 +722,22 @@ async def upload(
 
 
 @app.get("/entity/{entity_id}")
-def get_entity(entity_id: str):
-    """
-    Return an entity's coordinates, geocode, and full administrative hierarchy.
-
-    Example response:
-    {
-      "id": "SCHOOL001",
-      "lat": 23.8103, "lng": 90.4125,
-      "geocode": "302600470102034",
-      "level": "village",
-      "hierarchy": {
-        "division":  {"geocode": "30",   "name": "Dhaka"},
-        "district":  {"geocode": "3026", "name": "Dhaka"},
-        "upazila":   {"geocode": "30260047", "name": "Savar"},
-        ...
-      }
-    }
-    """
-    _require_loaded()
-    record = store.get_entity(entity_id)
+def get_entity(entity_id: str, session_id: str = Query('default')):
+    """Return an entity's coordinates, geocode, and full administrative hierarchy."""
+    _require_loaded(session_id)
+    s      = session_mgr.get(session_id)
+    record = s.get_entity(entity_id)
     if record is None:
         raise HTTPException(404, f"Entity not found: {entity_id!r}")
 
-    gc_info = geocoder.get_info(record['geocode'])
+    gc_info   = geocoder.get_info(record['geocode'])
     hierarchy = geocoder.build_hierarchy(record['geocode'])
 
     return {
         **record,
-        'level': gc_info['level'],
-        'name': gc_info['name'],
-        'hierarchy': hierarchy,
+        'level':              gc_info['level'],
+        'name':               gc_info['name'],
+        'hierarchy':          hierarchy,
         'geocode_precision_m': 55,
     }
 
@@ -701,81 +745,59 @@ def get_entity(entity_id: str):
 @app.get("/entity/{entity_id}/peers")
 def get_peers(
     entity_id: str,
-    level: str = Query('division', description="Hierarchy level to aggregate at"),
-    offset: int = Query(0, ge=0),
-    limit: int = Query(1000, ge=1, le=10000),
+    level:     str = Query('division', description="Hierarchy level to aggregate at"),
+    offset:    int = Query(0, ge=0),
+    limit:     int = Query(1000, ge=1, le=10000),
+    session_id:str = Query('default'),
 ):
-    """
-    Return all entities in the same administrative area as `entity_id` at `level`.
-
-    Supported levels: division, district, upazila, union, mauza,
-                      village, ea, citycorporation, municipality
-
-    Example: /entity/SCHOOL001/peers?level=district&limit=100
-    Returns all entities (schools, or whatever was uploaded) in the same district.
-    """
-    _require_loaded()
+    _require_loaded(session_id)
+    s = session_mgr.get(session_id)
 
     prefix_len = LEVEL_TO_PREFIX_LEN.get(level)
     if prefix_len is None:
-        raise HTTPException(
-            400,
-            f"Invalid level: {level!r}. Valid levels: {LEVEL_NAMES}"
-        )
+        raise HTTPException(400, f"Invalid level: {level!r}. Valid: {LEVEL_NAMES}")
 
-    # Find the entity
-    record = store.get_entity(entity_id)
+    record = s.get_entity(entity_id)
     if record is None:
         raise HTTPException(404, f"Entity not found: {entity_id!r}")
 
     geocode = record['geocode']
     if len(geocode) < prefix_len:
-        entity_level = geocoder.get_info(geocode)['level']
-        raise HTTPException(
-            400,
-            f"Entity is at level={entity_level!r} (geocode length {len(geocode)}); "
-            f"cannot aggregate at {level!r} (requires length {prefix_len})"
-        )
+        raise HTTPException(400,
+            f"Entity geocode too short for level {level!r} (need {prefix_len} chars, got {len(geocode)})")
 
     prefix = geocode[:prefix_len]
-    result = store.get_area(prefix, offset, limit)
+    result = s.get_area(prefix, offset, limit)
     if result is None:
         raise HTTPException(404, f"No indexed data for geocode prefix: {prefix!r}")
 
     peers, total = result
-    area_info = geocoder.get_info(prefix)
+    area_info    = geocoder.get_info(prefix)
 
     return {
-        'entity_id': entity_id,
-        'entity_geocode': geocode,
-        'level': level,
-        'area_geocode': prefix,
-        'area_name': area_info['name'],
-        'total': total,
-        'offset': offset,
-        'returned': len(peers),
-        'has_more': offset + len(peers) < total,
-        'peers': peers,
+        'entity_id':     entity_id,
+        'entity_geocode':geocode,
+        'level':         level,
+        'area_geocode':  prefix,
+        'area_name':     area_info['name'],
+        'total':         total,
+        'offset':        offset,
+        'returned':      len(peers),
+        'has_more':      offset + len(peers) < total,
+        'peers':         peers,
     }
 
 
 @app.get("/area/{geocode}")
 def get_area(
-    geocode: str,
-    offset: int = Query(0, ge=0),
-    limit: int = Query(1000, ge=1, le=10000),
+    geocode:    str,
+    offset:     int = Query(0, ge=0),
+    limit:      int = Query(1000, ge=1, le=10000),
+    session_id: str = Query('default'),
 ):
-    """
-    Return all entities in the geographic area identified by `geocode`.
-
-    geocode examples:
-      30         = Dhaka Division (all entities)
-      3026       = Dhaka District
-      30260047   = Specific upazila
-    """
-    _require_loaded()
-
-    result = store.get_area(geocode, offset, limit)
+    _require_loaded(session_id)
+    s      = session_mgr.get(session_id)
+    result = s.get_area(geocode, offset, limit)
     if result is None:
         raise HTTPException(404, f"No data for geocode: {geocode!r}")
 
@@ -783,11 +805,11 @@ def get_area(
     gc_info = geocoder.get_info(geocode)
 
     return {
-        'geocode': geocode,
-        'name': gc_info['name'],
-        'level': gc_info['level'],
-        'total': total,
-        'offset': offset,
+        'geocode':  geocode,
+        'name':     gc_info['name'],
+        'level':    gc_info['level'],
+        'total':    total,
+        'offset':   offset,
         'returned': len(entities),
         'has_more': offset + len(entities) < total,
         'entities': entities,
@@ -796,60 +818,89 @@ def get_area(
 
 @app.get("/areas")
 def list_areas(
-    level: str = Query('division',
-                       description="Hierarchy level: division, district, upazila, union, ..."),
+    level:      str = Query('division'),
+    session_id: str = Query('default'),
 ):
-    """
-    List all geographic areas at the given level with entity counts.
-
-    Useful for building dropdowns or summary statistics.
-    """
-    _require_loaded()
-
+    _require_loaded(session_id)
+    s          = session_mgr.get(session_id)
     prefix_len = LEVEL_TO_PREFIX_LEN.get(level)
     if prefix_len is None:
-        raise HTTPException(
-            400,
-            f"Invalid level: {level!r}. Valid levels: {LEVEL_NAMES}"
-        )
+        raise HTTPException(400, f"Invalid level: {level!r}. Valid: {LEVEL_NAMES}")
 
-    raw = store.list_areas(prefix_len)
+    raw    = s.list_areas(prefix_len)
     result = []
     for entry in raw:
-        gc = entry['geocode']
+        gc   = entry['geocode']
         info = geocoder.get_info(gc)
-        result.append({
-            'geocode': gc,
-            'name': info['name'],
-            'level': level,
-            'count': entry['count'],
-        })
-
+        result.append({'geocode': gc, 'name': info['name'], 'level': level, 'count': entry['count']})
     result.sort(key=lambda x: x['geocode'])
-
-    return {
-        'level': level,
-        'total_areas': len(result),
-        'areas': result,
-    }
+    return {'level': level, 'total_areas': len(result), 'areas': result}
 
 
 @app.get("/entities/all")
-def all_entities():
+def all_entities(session_id: str = Query('default')):
     """
-    Return ALL entities in a single request.
+    Return ALL entities in one request (capped at ENTITY_RENDER_LIMIT).
 
-    Replaces the old N+1 pattern (GET /areas → N × GET /area/{geocode}).
-    One round trip instead of two → dramatically faster initial map load.
-    Each record includes id, lat, lng, and label (if a display_field is set).
+    For datasets > ENTITY_RENDER_LIMIT the response includes truncated=true and
+    n_total so the frontend can warn the user.  Use /entities/clustered for a
+    zoom-aware cluster view of very large datasets.
     """
-    _require_loaded()
-    records = store.get_all_entities()
+    _require_loaded(session_id)
+    s       = session_mgr.get(session_id)
+    n_total = s.meta.get("n_entities", 0)
+    records = s.get_all_entities()          # already capped inside the method
     return {
-        "n_entities":    len(records),
-        "display_field": store.display_field,
+        "n_entities":    n_total,
+        "returned":      len(records),
+        "truncated":     len(records) < n_total,
+        "display_field": s.display_field,
         "entities":      records,
     }
+
+
+@app.get("/entities/clustered")
+def entities_clustered(
+    zoom:       int = Query(7, ge=1, le=18),
+    session_id: str = Query('default'),
+):
+    """
+    Return cluster centroids sized by entity count — ideal for large datasets.
+
+    zoom < 8  → division-level clusters   (prefix len 2)
+    zoom 8-9  → district-level clusters   (prefix len 4)
+    zoom 10-11→ upazila-level clusters    (prefix len 8)
+    zoom 12+  → union-level clusters      (prefix len 13)
+
+    Each cluster: {geocode, name, lat, lng, count}
+    """
+    _require_loaded(session_id)
+    s = session_mgr.get(session_id)
+
+    if   zoom < 8:  prefix_len = 2
+    elif zoom < 10: prefix_len = 4
+    elif zoom < 12: prefix_len = 8
+    else:           prefix_len = 13
+
+    areas   = s.list_areas(prefix_len)
+    results = []
+    for area in areas:
+        # Sample up to 200 records to estimate centroid quickly
+        recs, total = s.get_area(area['geocode'], 0, min(200, area['count']))
+        if not recs:
+            continue
+        avg_lat = sum(r['lat'] for r in recs) / len(recs)
+        avg_lng = sum(r['lng'] for r in recs) / len(recs)
+        info    = geocoder.get_info(area['geocode'])
+        results.append({
+            'geocode': area['geocode'],
+            'name':    info['name'],
+            'lat':     round(avg_lat, 5),
+            'lng':     round(avg_lng, 5),
+            'count':   total,
+        })
+
+    return {'clusters': results, 'prefix_len': prefix_len, 'zoom': zoom}
 
 
 class _GeocodeBatchItem(BaseModel):
@@ -864,11 +915,11 @@ class _GeocodeBatchInput(BaseModel):
 @app.post("/geocode/batch")
 def geocode_batch(body: _GeocodeBatchInput):
     """
-    Batch reverse-geocode coordinates → geocode string + full hierarchy.
+    Stateless batch reverse-geocode: lat/lng → geocode + hierarchy.
 
-    Used by the browser when processing a CSV locally (no server-side entity
-    storage required).  The V5 raster lookup runs in <1 ms for 5 000 points,
-    so even 50 000-row CSVs finish in a few seconds.
+    Used for the local upload flow (small CSVs < ~50K rows processed in
+    the browser).  The V5 raster lookup is O(1) per point, so 5 000-item
+    chunks complete in well under 100 ms.  No session needed.
     """
     results = []
     for item in body.coords:
@@ -879,15 +930,90 @@ def geocode_batch(body: _GeocodeBatchInput):
 
 
 # =============================================================================
+# Google Auth + User Profile endpoints
+# =============================================================================
+
+@app.post("/auth/google")
+async def auth_google(credential: str = Body(..., embed=True)):
+    """Verify a Google ID token. Returns {session_id, sub, email, name, picture}."""
+    try:
+        idinfo = google_id_token.verify_oauth2_token(
+            credential,
+            google_auth_requests.Request(),
+            GOOGLE_CLIENT_ID,
+        )
+    except ValueError as exc:
+        raise HTTPException(401, f"Invalid Google token: {exc}")
+
+    sub     = idinfo["sub"]
+    email   = idinfo.get("email", "")
+    name    = idinfo.get("name", "")
+    picture = idinfo.get("picture", "")
+
+    user_dir = os.path.join(USERS_DIR, sub)
+    os.makedirs(user_dir, exist_ok=True)
+
+    profile = {"sub": sub, "email": email, "name": name, "picture": picture}
+    with open(os.path.join(user_dir, "profile.json"), "w") as f:
+        json.dump(profile, f)
+
+    session_id = f"u_{sub}"
+    session_mgr.get(session_id)   # pre-warm so directory + store exist immediately
+
+    return {**profile, "session_id": session_id}
+
+
+@app.get("/user/settings")
+def get_user_settings(session_id: str = Query(...)):
+    """Return saved display/label preferences for an authenticated user."""
+    if not session_id.startswith("u_"):
+        raise HTTPException(400, "Not an authenticated session")
+    path = os.path.join(USERS_DIR, session_id[2:], "settings.json")
+    if not os.path.exists(path):
+        return {"display_field": "id"}
+    with open(path) as f:
+        return json.load(f)
+
+
+@app.put("/user/settings")
+async def put_user_settings(session_id: str = Query(...), body: dict = Body(...)):
+    """Persist display/label preferences for an authenticated user."""
+    if not session_id.startswith("u_"):
+        raise HTTPException(400, "Not an authenticated session")
+    user_dir = os.path.join(USERS_DIR, session_id[2:])
+    os.makedirs(user_dir, exist_ok=True)
+    path = os.path.join(user_dir, "settings.json")
+    existing = {}
+    if os.path.exists(path):
+        with open(path) as f:
+            existing = json.load(f)
+    existing.update({k: v for k, v in body.items()})
+    with open(path, "w") as f:
+        json.dump(existing, f)
+    return existing
+
+
+@app.get("/user/csv")
+def download_user_csv(session_id: str = Query(...)):
+    """Download the CSV that was uploaded to this authenticated account."""
+    if not session_id.startswith("u_"):
+        raise HTTPException(400, "Not an authenticated session")
+    csv_path = os.path.join(USERS_DIR, session_id[2:], "input.csv")
+    if not os.path.exists(csv_path):
+        raise HTTPException(404, "No CSV uploaded yet for this account")
+    return FileResponse(csv_path, media_type="text/csv", filename="my_data.csv")
+
+
+# =============================================================================
 # Helpers
 # =============================================================================
 
-def _require_loaded():
-    if not store or not store.is_loaded:
-        raise HTTPException(
-            503,
-            "No data loaded. Upload a CSV via POST /upload and wait for the build to complete."
-        )
+def _require_loaded(session_id: str = 'default'):
+    s = session_mgr.get(session_id) if session_mgr else None
+    if not s or not s.is_loaded:
+        raise HTTPException(503,
+            f"No data loaded for session {session_id!r}. "
+            "Upload a CSV via POST /upload and wait for the build to complete.")
 
 
 # =============================================================================

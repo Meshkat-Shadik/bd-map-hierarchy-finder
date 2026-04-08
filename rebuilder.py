@@ -54,8 +54,8 @@ def validate_inputs(csv_path: str) -> tuple[bool, str]:
     return True, ""
 
 
-def signal_reload():
-    signal_path = os.path.join(DATA_DIR, ".reload_signal")
+def signal_reload(data_dir: str = None):
+    signal_path = os.path.join(data_dir or DATA_DIR, ".reload_signal")
     with open(signal_path, 'w') as f:
         f.write(time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()))
 
@@ -67,13 +67,16 @@ def run_pipeline(
     extra_fields: list = None,
     display_field: str = 'id',
     keep_segments: bool = False,
+    data_dir: str = None,
     verbose: bool = True,
 ) -> dict:
     """
     Run the full build pipeline.
     extra_fields: list of CSV column names to store as entity metadata.
+    data_dir: output directory (defaults to module-level DATA_DIR = data/).
     """
-    os.makedirs(DATA_DIR, exist_ok=True)
+    effective_data_dir = data_dir or DATA_DIR
+    os.makedirs(effective_data_dir, exist_ok=True)
 
     ok, err = validate_inputs(csv_path)
     if not ok:
@@ -103,6 +106,7 @@ def run_pipeline(
         n_workers=n_workers,
         chunk_size=chunk_size,
         extra_fields=extra_fields,
+        data_dir=effective_data_dir,
         verbose=verbose,
     )
 
@@ -121,11 +125,12 @@ def run_pipeline(
         keep_segments=keep_segments,
         schema_fields=extra_fields,
         display_field=display_field,
+        data_dir=effective_data_dir,
         verbose=verbose,
     )
 
     # ── 4. Signal hot-reload ──────────────────────────────────────────────────
-    signal_reload()
+    signal_reload(effective_data_dir)
 
     total_elapsed = time.perf_counter() - t_total
 
