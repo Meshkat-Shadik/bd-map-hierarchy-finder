@@ -34,16 +34,8 @@ from typing import Optional
 import numpy as np
 from fastapi import FastAPI, Query, Form, UploadFile, File, HTTPException, BackgroundTasks, Body
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import FileResponse
 from pydantic import BaseModel, Field
 import uvicorn
-from google.oauth2 import id_token as google_id_token
-from google.auth.transport import requests as google_auth_requests
-
-GOOGLE_CLIENT_ID = os.environ.get(
-    "GOOGLE_CLIENT_ID",
-    "476786425809-4ju4v578ae38vl0hu8sraoe1d61r230v.apps.googleusercontent.com",
-)
 
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 DATA_DIR = os.path.join(BASE_DIR, "data")
@@ -442,23 +434,16 @@ class V6MmapStore:
 # =============================================================================
 
 SESSIONS_DIR    = os.path.join(BASE_DIR, "data", "sessions")
-USERS_DIR       = os.path.join(BASE_DIR, "data", "users")   # persistent, never evicted
-MAX_SESSIONS    = 30        # LRU eviction when limit reached (anonymous only)
-SESSION_TTL_SEC = 86400     # 24 h of inactivity → evict (anonymous only)
+MAX_SESSIONS    = 30        # LRU eviction when limit reached
+SESSION_TTL_SEC = 86400     # 24 h of inactivity → evict
 # Cap for /entities/all to prevent gigantic JSON responses (50M rows × 50B ≈ 2.5 GB)
 ENTITY_RENDER_LIMIT = 200_000
 
 
 def _session_data_dir(session_id: str) -> str:
-    """Map a session ID to its data directory.
-    'default'  → data/
-    'u_{sub}'  → data/users/{sub}/   (Google-authenticated, permanent)
-    '{uuid}'   → data/sessions/{uuid}/  (anonymous, LRU-evicted)
-    """
+    """Map a session UUID to its data directory (backward compat: 'default' → data/)."""
     if session_id == 'default':
         return DATA_DIR
-    if session_id.startswith('u_'):
-        return os.path.join(USERS_DIR, session_id[2:])
     return os.path.join(SESSIONS_DIR, session_id)
 
 
@@ -491,16 +476,13 @@ class _SessionManager:
 
     def _evict(self):
         now = time.time()
-        # Only evict anonymous sessions (u_ prefix = authenticated, never evict)
         expired = [sid for sid, s in self._sessions.items()
-                   if not sid.startswith('u_') and now - s['last_seen'] > SESSION_TTL_SEC]
+                   if now - s['last_seen'] > SESSION_TTL_SEC]
         for sid in expired:
             del self._sessions[sid]
-        anon = [sid for sid in list(self._sessions) if not sid.startswith('u_')]
-        while len(anon) >= MAX_SESSIONS:
-            oldest = min(anon, key=lambda s: self._sessions[s]['last_seen'])
+        while len(self._sessions) >= MAX_SESSIONS:
+            oldest = min(self._sessions, key=lambda s: self._sessions[s]['last_seen'])
             del self._sessions[oldest]
-            anon.remove(oldest)
 
 
 # =============================================================================
@@ -927,81 +909,6 @@ def geocode_batch(body: _GeocodeBatchInput):
         h  = geocoder.build_hierarchy(gc) if gc else {}
         results.append({'id': item.id, 'geocode': gc, 'hierarchy': h})
     return {'results': results, 'count': len(results)}
-
-
-# =============================================================================
-# Google Auth + User Profile endpoints
-# =============================================================================
-
-@app.post("/auth/google")
-async def auth_google(credential: str = Body(..., embed=True)):
-    """Verify a Google ID token. Returns {session_id, sub, email, name, picture}."""
-    try:
-        idinfo = google_id_token.verify_oauth2_token(
-            credential,
-            google_auth_requests.Request(),
-            GOOGLE_CLIENT_ID,
-        )
-    except ValueError as exc:
-        raise HTTPException(401, f"Invalid Google token: {exc}")
-
-    sub     = idinfo["sub"]
-    email   = idinfo.get("email", "")
-    name    = idinfo.get("name", "")
-    picture = idinfo.get("picture", "")
-
-    user_dir = os.path.join(USERS_DIR, sub)
-    os.makedirs(user_dir, exist_ok=True)
-
-    profile = {"sub": sub, "email": email, "name": name, "picture": picture}
-    with open(os.path.join(user_dir, "profile.json"), "w") as f:
-        json.dump(profile, f)
-
-    session_id = f"u_{sub}"
-    session_mgr.get(session_id)   # pre-warm so directory + store exist immediately
-
-    return {**profile, "session_id": session_id}
-
-
-@app.get("/user/settings")
-def get_user_settings(session_id: str = Query(...)):
-    """Return saved display/label preferences for an authenticated user."""
-    if not session_id.startswith("u_"):
-        raise HTTPException(400, "Not an authenticated session")
-    path = os.path.join(USERS_DIR, session_id[2:], "settings.json")
-    if not os.path.exists(path):
-        return {"display_field": "id"}
-    with open(path) as f:
-        return json.load(f)
-
-
-@app.put("/user/settings")
-async def put_user_settings(session_id: str = Query(...), body: dict = Body(...)):
-    """Persist display/label preferences for an authenticated user."""
-    if not session_id.startswith("u_"):
-        raise HTTPException(400, "Not an authenticated session")
-    user_dir = os.path.join(USERS_DIR, session_id[2:])
-    os.makedirs(user_dir, exist_ok=True)
-    path = os.path.join(user_dir, "settings.json")
-    existing = {}
-    if os.path.exists(path):
-        with open(path) as f:
-            existing = json.load(f)
-    existing.update({k: v for k, v in body.items()})
-    with open(path, "w") as f:
-        json.dump(existing, f)
-    return existing
-
-
-@app.get("/user/csv")
-def download_user_csv(session_id: str = Query(...)):
-    """Download the CSV that was uploaded to this authenticated account."""
-    if not session_id.startswith("u_"):
-        raise HTTPException(400, "Not an authenticated session")
-    csv_path = os.path.join(USERS_DIR, session_id[2:], "input.csv")
-    if not os.path.exists(csv_path):
-        raise HTTPException(404, "No CSV uploaded yet for this account")
-    return FileResponse(csv_path, media_type="text/csv", filename="my_data.csv")
 
 
 # =============================================================================
